@@ -1,6 +1,6 @@
 import {
     formatMoney, formatNumberShort, formatDuration,
-    getNsDataThroughFile, runCommand, tryGetBitNodeMultipliers
+    getNsDataThroughFile, runCommand, getActiveSourceFiles, tryGetBitNodeMultipliers
 } from './helpers.js'
 
 let disableShorts = false;
@@ -10,6 +10,7 @@ let lastLog = ""; // We update faster than the stock-market ticks, but we don't 
 let allStockSymbols = []; // Stores the set of all symbols collected at start
 let mock = false; // If set to true, will "mock" buy/sell but not actually buy/sell anythingorecast
 let noisy = false; // If set to true, tprints and announces each time stocks are bought/sold
+let dictSourceFiles; // Populated at init, a dictionary of source-files the user has access to, and their level
 // Pre-4S configuration (influences how we play the stock market before we have 4S data, after which everything's fool-proof)
 let showMarketSummary = false;  // If set to true, will always generate and display the pre-4s forecast table in a separate tail window
 let minTickHistory; // This much history must be gathered before we will offer a stock forecast.
@@ -82,33 +83,40 @@ export async function main(ns) {
     nearTermForecastWindowLength = options['pre-4s-inversion-detection-window'] || 10;
     longTermForecastWindowLength = options['pre-4s-forecast-window'] || (marketCycleLength + 1);
     showMarketSummary = options['show-pre-4s-forecast'] || options['show-market-summary'];
-    // Global values must be reset at start lest they be left in memory from a prior run
+    // Other global values must be reset at start lest they be left in memory from a prior run
     lastTick = 0, totalProfit = 0, lastLog = "", marketCycleDetected = false, detectedCycleTick = 0, inversionAgreementThreshold = 6;
     let corpus = 0, myStocks = [], allStocks = [];
-    if (options.l || options.liquidate)
+
+    if (!ns.getPlayer().hasTixApiAccess) // You cannot use the stockmaster until you have API access
+        return log(ns, "ERROR: You have to buy stock market access and API access before you can run this script!", true);
+
+    if (options.l || options.liquidate) // If given the "liquidate" command, try to kill the version of ourself trading in stocks
         await runCommand(ns, `ns.ps().filter(proc => proc.filename == '${ns.getScriptName()}' && !proc.args.includes('-l') && !proc.args.includes('--liquidate'))` +
             `.forEach(proc => ns.kill(proc.pid))`, '/Temp/kill-script.js');
-    try {
-        allStockSymbols = await getNsDataThroughFile(ns, 'ns.stock.getSymbols()', '/Temp/stock-symbols.txt');
-        allStocks = await initAllStocks(ns, allStockSymbols);
-    } catch (err) {
-        if (String(err).includes("WSE Access"))
-            return log(ns, "You have to buy stock market access and API access before you can run this script!", true);
-        throw (err); // Any other errors should be reraised.
+
+    dictSourceFiles = await getActiveSourceFiles(ns); // Find out what source files the user has unlocked
+    if (!disableShorts && (!(8 in dictSourceFiles) || dictSourceFiles[8] < 2)) {
+        log(ns, "INFO: Shorting stocks has been disabled (you have not yet unlocked access to shorting)");
+        disableShorts = true;
     }
-    // If given the "liquidate" command, try to kill the version of ourself trading in stocks, and then sell all shares
+
+    allStockSymbols = await getNsDataThroughFile(ns, 'ns.stock.getSymbols()', '/Temp/stock-symbols.txt');
+    allStocks = await initAllStocks(ns, allStockSymbols);
+
     if (options.l || options.liquidate) {
         await liquidate(ns, allStockSymbols); // Sell all stocks
         return;
     } else if (!options.mock) { // If we're not liquidating or in mock mode, we MUST not run two stockmasters at once, or chaos will ensue
-        let otherStockmasters = (await getNsDataThroughFile(ns, `ns.ps()`)).filter(p => p.filename == ns.getScriptName()); // TODO: For bonus points, check all servers
+        let otherStockmasters = (await getNsDataThroughFile(ns, `ns.ps()`, '/Temp/process-list.txt')).filter(p => p.filename == ns.getScriptName()); // TODO: For bonus points, check all servers
         otherStockmasters = otherStockmasters.filter(p => JSON.stringify(ns.args) != JSON.stringify(p.args)); // Don't detect ourselves of course.
         if (otherStockmasters.some(p => !p.args.includes("--mock"))) // Exception, feel free to run multiple stockmasters in mock mode
             return log(ns, `ERROR: Another version of ${ns.getScriptName()} is already running with different args. Running twice is a bad idea!`, true, 'error');
     }
 
+    let bitnodeMults;
+    if (5 in dictSourceFiles) bitnodeMults = await tryGetBitNodeMultipliers(ns);
     // Assume bitnode mults are 1 if user doesn't have this API access yet
-    let bitnodeMults = (await tryGetBitNodeMultipliers(ns)) ?? { FourSigmaMarketDataCost: 1, FourSigmaMarketDataApiCost: 1 };
+    if (!bitnodeMults) bitnodeMults = { FourSigmaMarketDataCost: 1, FourSigmaMarketDataApiCost: 1 };
 
     if (showMarketSummary) await launchSummaryTail(ns); // Opens a separate script / window to continuously display the Pre4S forecast
 
@@ -131,13 +139,13 @@ export async function main(ns) {
         // Be more conservative with our decisions if we don't have 4S data
         const thresholdToBuy = pre4s ? options['pre-4s-buy-threshold-return'] : options['buy-threshold'];
         const thresholdToSell = pre4s ? options['pre-4s-sell-threshold-return'] : options['sell-threshold'];
+        if (myStocks.length > 0)
+            doStatusUpdate(ns, allStocks, myStocks, hudElement);
         if (pre4s && allStocks[0].priceHistory.length < minTickHistory) {
             log(ns, `Building a history of stock prices (${allStocks[0].priceHistory.length}/${minTickHistory})...`);
             await ns.sleep(sleepInterval);
             continue;
         }
-        else if (myStocks.length > 0)
-            doStatusUpdate(ns, allStocks, myStocks, hudElement);
 
         // Sell forecasted-to-underperform shares (worse than some expected return threshold)
         let sales = 0;
@@ -375,7 +383,7 @@ let summaryFile = '/Temp/stockmarket-summary.txt';
 let updateForecastFile = async (ns, summary) => await ns.write(summaryFile, summary, 'w');
 let launchSummaryTail = async ns => {
     let summaryTailScript = summaryFile.replace('.txt', '-tail.js');
-    if (await getNsDataThroughFile(ns, `ns.scriptRunning('${summaryTailScript}', ns.getHostname())`))
+    if (await getNsDataThroughFile(ns, `ns.scriptRunning('${summaryTailScript}', ns.getHostname())`, '/Temp/stockmarket-summary-is-running.txt'))
         return;
     //await getNsDataThroughFile(ns, `ns.scriptKill('${summaryTailScript}', ns.getHostname())`, summaryTailScript.replace('.js', '-kill.js')); // Only needed if we're changing the script below
     await runCommand(ns, `ns.disableLog('sleep'); ns.tail(); let lastRead = '';
@@ -507,16 +515,22 @@ async function tryGet4SApi(ns, playerStats, bitnodeMults, corpus, allStockSymbol
     if (playerStats.money < totalCost)
         await liquidate(ns, allStockSymbols);
     if (!playerStats.has4SData) {
-        if (await getNsDataThroughFile(ns, 'ns.stock.purchase4SMarketData()'))
+        if (await getNsDataThroughFile(ns, 'ns.stock.purchase4SMarketData()', '/Temp/purchase-4s.txt'))
             log(ns, `Purchased 4SMarketData for ${formatMoney(cost4sData)}!`, true, 'success');
         else
-            log(ns, 'Error attempting to purchase 4SMarketData!', true, 'error');
+            log(ns, 'ERROR attempting to purchase 4SMarketData!', false, 'error');
     }
-    if (await getNsDataThroughFile(ns, 'ns.stock.purchase4SMarketDataTixApi()')) {
+    if (await getNsDataThroughFile(ns, 'ns.stock.purchase4SMarketDataTixApi()', '/Temp/purchase-4s-api.txt')) {
         log(ns, `Purchased 4SMarketDataTixApi for ${formatMoney(cost4sApi)}!`, true, 'success');
         return true;
-    } else
-        log(ns, 'Error attempting to purchase 4SMarketDataTixApi!', true, 'error');
+    } else {
+        log(ns, 'ERROR attempting to purchase 4SMarketDataTixApi!', false, 'error');
+        if (!(5 in dictSourceFiles)) { // If we do not have access to bitnode multipliers, assume the cost is double and try again later
+            log(ns, 'INFO: Bitnode mults are not available (SF5) - assuming everything is twice as expensive in the current bitnode.');
+            bitnodeMults.FourSigmaMarketDataCost *= 2;
+            bitnodeMults.FourSigmaMarketDataApiCost *= 2;
+        }
+    }
     return false;
 }
 

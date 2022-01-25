@@ -1,4 +1,4 @@
-import { getNsDataThroughFile } from './helpers.js'
+import { getNsDataThroughFile, getFilePath } from './helpers.js'
 
 let spawnDelay = 50; // Delay to allow time for `installBackdoor` to start running before a background script connects back to 'home'
 
@@ -24,11 +24,11 @@ export let main = async ns => {
         ns.print(`${hackableServers.filter(s => myHackingLevel > ns.getServerRequiredHackingLevel(s)).length} servers are within our hack level (${myHackingLevel}).`);
         ns.print(`${hackableServers.filter(s => myHackingLevel > ns.getServerRequiredHackingLevel(s) && ns.hasRootAccess(s)).length} rooted servers are within our hack level (${myHackingLevel})`);
 
-        let toBackdoor = await getNsDataThroughFile(ns, `${JSON.stringify(hackableServers)}.filter(s => !ns.getServer(s).backdoorInstalled)`, '/Temp/backdoored-servers.txt');
+        let toBackdoor = await getNsDataThroughFile(ns, `${JSON.stringify(hackableServers)}.filter(s => !ns.getServer(s).backdoorInstalled)`, '/Temp/servers-to-backdoor.txt');
         let count = toBackdoor.length;
         ns.print(`${count} servers have yet to be backdoored.`);
-        if(count == 0) return;
-        
+        if (count == 0) return;
+
         ns.print(`${toBackdoor.filter(s => ns.hasRootAccess(s)).length} of ${count} servers to backdoor are currently rooted.`);
         toBackdoor = toBackdoor.filter(s => myHackingLevel > ns.getServerRequiredHackingLevel(s));
         ns.print(`${toBackdoor.length} of ${count} servers to backdoor are within our hack level (${myHackingLevel}).`);
@@ -46,7 +46,7 @@ export let main = async ns => {
             }
             ns.print(`Installing backdoor on "${server}"...`);
             // Kick off a separate script that will run backdoor before we connect to home.
-            var pid = ns.run('/Tasks/backdoor-all-servers.js.backdoor-one.js', 1, server);
+            var pid = ns.run(getFilePath('/Tasks/backdoor-all-servers.js.backdoor-one.js'), 1, server);
             if (pid === 0)
                 return ns.print(`Couldn't initiate a new backdoor of "${server}"" (insufficient RAM?). Will try again later.`);
             await ns.sleep(spawnDelay); // Wait some time for the external backdoor script to initiate its backdoor of the current connected server
